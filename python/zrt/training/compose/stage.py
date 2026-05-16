@@ -56,10 +56,11 @@ def op_to_time(
     gpu_name: str = "", dtype: Dtype = Dtype.BF16,
 ) -> float:
     """Roofline: op time = max(compute_time, memory_time)."""
+    from zrt.training.io.perf_tables import peak_tflops_for
     gpu = system.gpu
     compute_t = 0.0
     if flops > 0:
-        peak = gpu.flops_bf16 * 1e12
+        peak = peak_tflops_for(gpu, dtype)
         eff = achieved_flops_efficiency(gpu_name or gpu.name, dtype, flops)
         compute_t = flops / (peak * eff) if peak > 0 else 0.0
     memory_t = 0.0
@@ -89,10 +90,16 @@ def op_to_time_hetero(
     If either heterogeneous peak is missing, preserve the legacy unified-peak
     roofline instead of treating one side of the work as free.
     """
+    from zrt.training.io.perf_tables import peak_tflops_for
     gpu = system.gpu
     total_flops = cube_flops + vector_flops
     if not has_heterogeneous_compute(system):
         return op_to_time(total_flops, bytes_, system, gpu_name, dtype)
+
+    # Scale cube/vector peaks by dtype/bf16 ratio (cube_tflops is BF16 peak).
+    bf16_peak = gpu.flops_bf16 * 1e12
+    dtype_peak = peak_tflops_for(gpu, dtype)
+    scale = dtype_peak / bf16_peak if bf16_peak > 0 else 1.0
 
     compute_t = 0.0
     if total_flops > 0:
@@ -100,10 +107,10 @@ def op_to_time_hetero(
         cube_t = 0.0
         vector_t = 0.0
         if cube_flops > 0:
-            peak_cube = gpu.cube_tflops * 1e12
+            peak_cube = gpu.cube_tflops * 1e12 * scale
             cube_t = cube_flops / (peak_cube * eff) if peak_cube > 0 else 0.0
         if vector_flops > 0:
-            peak_vector = gpu.vector_tflops * 1e12
+            peak_vector = gpu.vector_tflops * 1e12 * scale
             vector_t = vector_flops / (peak_vector * eff) if peak_vector > 0 else 0.0
         if cube_t > 0 or vector_t > 0:
             compute_t = max(cube_t, vector_t) + (1.0 - overlap_ratio) * min(cube_t, vector_t)
