@@ -208,6 +208,7 @@ def _parse_system(d: dict) -> SystemSpec:
         name=hw.name,
         flops_bf16=hw.compute.bf16_tflops,
         flops_fp8=hw.compute.fp8_tops or hw.compute.bf16_tflops * 2,
+        flops_fp4=hw.compute.fp4_tops,   # 0 -> peak_tflops_for falls back to fp8
         hbm_gb=hw.memory.capacity_gb,
         hbm_bw_gbps=hw.memory.hbm_bandwidth_gbps,
         cube_tflops=hw.compute.cube_bf16_tflops,

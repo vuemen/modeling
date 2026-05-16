@@ -46,3 +46,18 @@ def test_fp8_falls_back_to_bf16_when_unsupported():
     # A100-like: no FP8 hardware
     gpu = _gpu(fp8=0.0, fp4=0.0)
     assert peak_tflops_for(gpu, Dtype.FP8_E4M3) == pytest.approx(989.0e12)
+
+
+def test_b300_yaml_loads_with_fp4_tops():
+    """B300 spec declares native FP4."""
+    from zrt.hardware.registry import load
+    hw = load("nvidia_b300")
+    assert hw.compute.fp4_tops > 0
+    assert hw.compute.fp8_tops > hw.compute.bf16_tflops  # FP8 >= 2x BF16
+
+
+def test_h100_yaml_declares_fp4_tops_zero():
+    """H100 lacks native FP4 hardware -> fp4_tops must be 0 in spec."""
+    from zrt.hardware.registry import load
+    hw = load("nvidia_h100_sxm")
+    assert hw.compute.fp4_tops == 0.0
