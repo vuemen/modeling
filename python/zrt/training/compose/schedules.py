@@ -369,7 +369,8 @@ class DualPipeComposer(PipelineComposer):
 
         # Reference: DualPipe README formula (PP/2-1)*t_stage
         # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
-        bubble = max(pp // 2 - 1, 0) * t_stage_max
+        # pp=3: half-stage bubble (not floored to zero)
+        bubble = max(pp / 2 - 1, 0) * t_stage_max
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
@@ -429,7 +430,8 @@ class DualPipeVComposer(PipelineComposer):
 
         # Reference: DualPipeV README formula (PP/2-1)/V*t_stage
         # pp=2: two anti-parallel streams perfectly fill each other → zero bubble
-        bubble = max(pp // 2 - 1, 0) / V * t_stage_max
+        # pp=3: half-stage bubble (not floored to zero)
+        bubble = max(pp / 2 - 1, 0) / V * t_stage_max
         warmup = bubble / 2.0
         cooldown = bubble / 2.0
         steady = M * t_stage_max
