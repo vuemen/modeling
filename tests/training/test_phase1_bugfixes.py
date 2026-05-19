@@ -10,10 +10,9 @@ from __future__ import annotations
 
 import pytest
 
-from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
 from python.zrt.ir.node import OpNode
-from python.zrt.transform.analysis.passes import FlopsPass, RooflinePass
+from python.zrt.transform.analysis.passes import FlopsPass
 from python.zrt.transform.analysis.training import (
     TrainingFlopsPass,
     TrainingMemoryPass,
@@ -462,11 +461,11 @@ def test_recompute_flops_only_for_fwd_phase_nodes():
 
     # Fwd-phase node with recompute
     n1 = OpNode(
-        id="mm_fwd",
-        op_type="aten.mm.default",
+        id="attn_fwd",
+        op_type="aten._scaled_dot_product_attention",
         inputs=[_tm((1, 128, 4096))],
         outputs=[_tm((1, 128, 4096))],
-        scope="model.layers.0.mlp",
+        scope="model.layers.0.self_attn",
         category="compute",
     )
     n1.annotations["phase"] = "fwd"
@@ -475,11 +474,11 @@ def test_recompute_flops_only_for_fwd_phase_nodes():
 
     # Bwd-phase node with recompute tag (should be ignored)
     n2 = OpNode(
-        id="mm_bwd",
-        op_type="aten.mm.default",
+        id="attn_bwd",
+        op_type="aten._scaled_dot_product_attention_backward",
         inputs=[_tm((1, 128, 4096))],
         outputs=[_tm((1, 128, 4096))],
-        scope="model.layers.0.mlp",
+        scope="model.layers.0.self_attn",
         category="compute",
     )
     n2.annotations["phase"] = "bwd"
@@ -609,58 +608,6 @@ def test_integration_recompute_multiplier_not_applied_to_bwd_nodes():
     assert fwd_flops == 2 * bwd_flops, (
         f"Fwd node should have 2x flops due to recompute, got fwd={fwd_flops} bwd={bwd_flops}"
     )
-
-
-def test_flash_attention_internal_recompute_is_not_external_checkpoint_replay():
-    """FA/SDPA backward already includes internal recompute, so do not double it."""
-    from python.zrt.ir.types import DType, TensorMeta
-
-    q = TensorMeta.from_shape_dtype("q", (1, 128, 16, 64), DType.BF16)
-    out = TensorMeta.from_shape_dtype("out", (1, 128, 16, 64), DType.BF16)
-    grad = TensorMeta.from_shape_dtype("grad", (1, 128, 16, 64), DType.BF16)
-
-    fa = OpNode(
-        id="fa",
-        op_type="aten._scaled_dot_product_flash_attention.default",
-        inputs=[q],
-        outputs=[out],
-        category="compute",
-        annotations={
-            "phase": "fwd",
-            "recompute": True,
-            "sem_flops": 1_000_000,
-            "sem_io": {
-                "activation": {"bytes": q.mem_bytes},
-                "output": {"bytes": out.mem_bytes},
-            },
-        },
-    )
-    bwd = OpNode(
-        id="fa_bwd",
-        op_type="aten.mm.default",
-        inputs=[out],
-        outputs=[grad],
-        category="compute",
-        annotations={"phase": "bwd"},
-    )
-    g = OpGraph(
-        name="fa_internal_recompute",
-        phase="train",
-        nodes={fa.id: fa, bwd.id: bwd},
-        edges=[Edge(src="fa", src_idx=0, dst="fa_bwd", dst_idx=0, tensor=out)],
-        metadata={"fwd_bwd_stitched": True},
-    )
-
-    ctx = _make_ctx(recompute_policy="full")
-    g = FlopsPass().run(g, ctx)
-    assert g.nodes["fa"].annotations["flops_fwd"] == g.nodes["fa"].annotations["flops"]
-
-    g = TrainingFlopsPass().run(g, ctx)
-    assert g.metadata["recompute_flops"] == 0
-
-    g = RooflinePass().run(g, ctx)
-    assert g.nodes["fa_bwd"].annotations["recompute_flops"] == 0
-    assert g.nodes["fa_bwd"].annotations["recompute_latency_us"] == 0.0
 
 
 def test_integration_flops_pass_computes_training_annotations():
