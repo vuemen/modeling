@@ -71,11 +71,13 @@ class FlopsPass(GraphPass):
                 # Fallback to roofline formula
                 flops, read_b, write_b = sim._fmr(node)
 
-            # MoE expert scaling: captured graph has only 1 expert's ops,
-            # but real model activates moe_active_experts per token.
+            # MoE expert scaling: unfused captures usually contain one routed
+            # expert's ops, while ExpertGroupedMMPass materializes the local
+            # expert group in the GroupedMatMul shape already.
             if moe_scale > 1 and node.scope and self._is_expert_scope(node.scope):
-                ep_local = node.annotations.get("ep_experts_local", 0)
-                if ep_local > 0 and num_experts_total > 0:
+                if node.annotations.get("fused_by") == "expert_grouped_mm":
+                    scale = 1.0
+                elif (ep_local := node.annotations.get("ep_experts_local", 0)) > 0 and num_experts_total > 0:
                     ep_frac = ep_local / num_experts_total
                     scale = moe_scale * ep_frac
                 else:

@@ -329,6 +329,7 @@ class TransformedGraphExcelWriter:
             ("Output Dtypes", 20),
             # ── compute ──────────────────────────────────────────────────────
             ("FLOPs", 14),
+            ("Effective FLOPs (with recompute)", 26),
             ("FLOPs Formula (sym)", 24),
             ("FLOPs Formula (num)", 32),
             # ── memory access ─────────────────────────────────────────────────
@@ -417,6 +418,7 @@ class TransformedGraphExcelWriter:
                 input_dtypes,
                 output_dtypes,
                 # compute
+                node.annotations.get("flops", ""),
                 node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
                 formulas["flops_sym"],
                 formulas["flops_num"],
@@ -1270,6 +1272,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             ("Output Shapes", 50),
             # ── compute ──────────────────────────────────────────────────────
             ("FLOPs", 14),
+            ("Effective FLOPs (with recompute)", 26),
             ("FLOPs Formula (sym)", 24),
             ("FLOPs Formula (num)", 32),
             # ── memory access ─────────────────────────────────────────────────
@@ -1308,7 +1311,13 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 self._comm_fill if node.is_comm else self._compute_fill
             )
             formulas = get_op_formulas(node)
-            comm_vol = sum(t.mem_bytes for t in node.outputs) if node.is_comm else ""
+            comm_vol = ""
+            if node.is_comm:
+                comm_vol = node.attrs.get("msg_bytes")
+                if comm_vol is None:
+                    comm_vol = node.attrs.get("bytes")
+                if comm_vol is None:
+                    comm_vol = sum(t.mem_bytes for t in node.outputs)
             values = [
                 node.id,
                 node.name or (node.scope.rsplit(".", 1)[-1] if node.scope else ""),
@@ -1321,6 +1330,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
                 ", ".join(str(t.shape) for t in node.inputs),
                 ", ".join(str(t.shape) for t in node.outputs),
                 # compute
+                node.annotations.get("flops", ""),
                 node.annotations.get("flops_fwd", node.annotations.get("flops", "")),
                 formulas["flops_sym"],
                 formulas["flops_num"],
@@ -1526,6 +1536,7 @@ class TrainingGraphExcelWriter(TransformedGraphExcelWriter):
             ("Forward compute (ms)", round(report.fwd_compute_ms, 3)),
             ("Backward compute (ms)", round(report.bwd_compute_ms, 3)),
             ("Recompute compute (ms)", round(recompute_compute_ms, 3)),
+            ("Compute time note", "Forward + backward + recompute compute"),
             ("Exposed comm (ms)", round(report.exposed_comm_ms, 3)),
             ("", ""),
             ("=== HW Efficiency ===", ""),

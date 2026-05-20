@@ -140,6 +140,8 @@ class CommInserterPass(GraphPass):
         micro_batch = ctx.training.micro_batch if ctx.training else 1
         topk = ctx.profile.moe_active if ctx.profile else 8
 
+        # Per A2A direction on this EP rank. Dispatch and combine each carry
+        # one BF16 hidden activation stream for the routed top-k tokens.
         ep_msg_bytes = micro_batch * seq_len * hidden * topk * dtype_bytes // ep
 
         dispatch_tensor = TensorMeta.from_shape_dtype(
@@ -183,7 +185,9 @@ class CommInserterPass(GraphPass):
                     inputs=[dispatch_tensor],
                     outputs=[dispatch_tensor],
                     attrs={"group_size": ep, "collective": "all_to_all",
-                           "role": "dispatch", "msg_bytes": ep_msg_bytes},
+                           "role": "dispatch", "msg_bytes": ep_msg_bytes,
+                           "msg_bytes_semantics": "per_a2a_direction",
+                           "dtype_bytes": dtype_bytes},
                     scope=first.scope,
                     layer=first.layer,
                     category="communication",
@@ -200,7 +204,9 @@ class CommInserterPass(GraphPass):
                     inputs=[combine_tensor],
                     outputs=[combine_tensor],
                     attrs={"group_size": ep, "collective": "all_to_all",
-                           "role": "combine", "msg_bytes": ep_msg_bytes},
+                           "role": "combine", "msg_bytes": ep_msg_bytes,
+                           "msg_bytes_semantics": "per_a2a_direction",
+                           "dtype_bytes": dtype_bytes},
                     scope=last.scope,
                     layer=last.layer,
                     category="communication",

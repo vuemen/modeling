@@ -42,7 +42,7 @@ def _capture_model():
         raise
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def captured_model():
     return _capture_model()
 
@@ -173,6 +173,7 @@ class TestEPE2E:
         for n in u.nodes.values():
             if n.op_type == "comm.all_to_all":
                 assert n.attrs["msg_bytes"] == expected
+                assert n.attrs["msg_bytes_semantics"] == "per_a2a_direction"
 
     def test_shared_expert_not_epoch_annotated(self, ep8_all):
         _, _, t = ep8_all

@@ -1,5 +1,7 @@
 """Tests for python.zrt.transform pipeline."""
 import pytest
+from types import SimpleNamespace
+
 from python.zrt.ir.node import OpNode
 from python.zrt.ir.edge import Edge
 from python.zrt.ir.graph import OpGraph
@@ -11,6 +13,7 @@ from python.zrt.transform import (
     build_default_pipeline,
 )
 from python.zrt.transform.analysis.passes import FlopsPass, RooflinePass, StreamAssignPass
+from python.zrt.transform.parallel.expert_grouped_mm import ExpertGroupedMMPass
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -214,6 +217,106 @@ def test_comm_inserter_inserts_ep_a2a_per_phase():
     for node_id, phase in expected.items():
         assert node_id in out.nodes
         assert out.nodes[node_id].annotations["phase"] == phase
+        assert out.nodes[node_id].attrs["msg_bytes_semantics"] == "per_a2a_direction"
+        assert out.nodes[node_id].attrs["dtype_bytes"] == 2
+
+
+def test_expert_grouped_mm_backward_preserves_external_outputs_and_gate_up_width():
+    src = _linear_node("src", "input", (2, 8), (2, 8))
+    down = _linear_node(
+        "down_bwd",
+        "transformer.layers.0.ffn.experts.0.w2",
+        (2, 8),
+        (2, 4),
+    )
+    gate = _linear_node(
+        "gate_bwd",
+        "transformer.layers.0.ffn.experts.0.w1",
+        (2, 4),
+        (2, 5),
+    )
+    up = _linear_node(
+        "up_bwd",
+        "transformer.layers.0.ffn.experts.0.w3",
+        (2, 4),
+        (2, 7),
+    )
+    gate_sink = _linear_node("gate_sink", "post.gate", (2, 5), (2, 5))
+    up_sink = _linear_node("up_sink", "post.up", (2, 7), (2, 7))
+    for n in (down, gate, up):
+        n.annotations.update({"phase": "bwd", "ep_needs_a2a": True})
+
+    graph = OpGraph(
+        name="bwd_grouped",
+        phase="train",
+        nodes={n.id: n for n in (src, down, gate, up, gate_sink, up_sink)},
+        edges=[
+            Edge("src", 0, "down_bwd", 0, src.outputs[0]),
+            Edge("down_bwd", 0, "gate_bwd", 0, down.outputs[0]),
+            Edge("down_bwd", 0, "up_bwd", 0, down.outputs[0]),
+            Edge("gate_bwd", 0, "gate_sink", 0, gate.outputs[0]),
+            Edge("up_bwd", 0, "up_sink", 0, up.outputs[0]),
+        ],
+        metadata={"seq_len": 4, "hidden": 8},
+    )
+    ctx = _ctx(ep=2)
+    ctx.profile = SimpleNamespace(num_experts=4, moe_active=2)
+
+    out = ExpertGroupedMMPass().run(graph, ctx)
+
+    gate_up_id = "transformer_layers_0_ffn_grouped_gate_up_bwd"
+    assert gate_up_id in out.nodes
+    gate_up = out.nodes[gate_up_id]
+    assert gate_up.inputs[1].shape == (2, 4, 12)
+    assert gate_up.outputs[0].shape == (2, 2, 12)
+    assert "gate_sink" in out.successors(gate_up_id)
+    assert "up_sink" in out.successors(gate_up_id)
+
+
+def test_flops_pass_does_not_ep_scale_expert_grouped_mm_again():
+    grouped = OpNode(
+        id="grouped",
+        op_type="GroupedMatMul",
+        inputs=[_t("a", (2, 3, 4)), _t("b", (2, 4, 5))],
+        outputs=[_t("out", (2, 3, 5))],
+        scope="model.layers.0.ffn.experts.grouped",
+        category="compute",
+        annotations={
+            "fused_by": "expert_grouped_mm",
+            "ep_experts_local": 4,
+        },
+    )
+    graph = OpGraph(
+        name="flops_grouped",
+        phase="train",
+        nodes={"grouped": grouped},
+        metadata={"moe_active_experts": 6, "moe_total_experts": 8},
+    )
+
+    out = FlopsPass().run(graph, _ctx(ep=2))
+
+    assert out.nodes["grouped"].annotations["flops"] == 2 * 2 * 3 * 4 * 5
+
+
+def test_excel_export_separates_base_and_effective_flops(tmp_path):
+    from openpyxl import load_workbook
+    from python.zrt.transform.exporter import TransformedGraphExcelWriter
+
+    node = _linear_node("mm", "model.layers.0.mlp", (2, 4), (2, 8))
+    node.annotations.update({"flops": 100, "flops_fwd": 200})
+    graph = OpGraph(name="export_flops", phase="train", nodes={"mm": node})
+    path = tmp_path / "report.xlsx"
+
+    TransformedGraphExcelWriter().write(graph, _ctx(), path)
+
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb["Transformed Operators"]
+    rows = list(ws.iter_rows(values_only=True))
+    header = list(rows[0])
+    flops_idx = header.index("FLOPs")
+    effective_idx = header.index("Effective FLOPs (with recompute)")
+    assert rows[1][flops_idx] == 100
+    assert rows[1][effective_idx] == 200
 
 
 # ── StreamAssignPass ──────────────────────────────────────────────────────────

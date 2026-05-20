@@ -286,9 +286,13 @@ class ExpertGroupedMMPass(GraphPass):
         H = downs[0].inputs[0].shape[-1] if downs[0].inputs else hidden
         ffn = downs[0].outputs[0].shape[-1] if downs[0].outputs else (
             gates[0].inputs[0].shape[-1] if gates[0].inputs else 3072)
+        gate_dim = gates[0].outputs[0].shape[-1] if gates[0].outputs else ffn
+        up_dim = ups[0].outputs[0].shape[-1] if ups[0].outputs else gate_dim
+        gate_up_dim = gate_dim + up_dim
         old_ids = {n.id for n in nodes}
 
         in_edges = [e for e in g.edges if e.dst in old_ids and e.src not in old_ids]
+        out_edges = [e for e in g.edges if e.src in old_ids and e.dst not in old_ids]
         if not in_edges:
             return
 
@@ -314,9 +318,9 @@ class ExpertGroupedMMPass(GraphPass):
             gate_up_id, f"{layer_key}.moe",
             [
                 TensorMeta.from_shape_dtype("grouped_gate_up_bwd_in", (G, M, ffn), DType.BF16),
-                _weight_tensor("grouped_gate_up_bwd_weight", (G, ffn, ffn * 2), DType.BF16),
+                _weight_tensor("grouped_gate_up_bwd_weight", (G, ffn, gate_up_dim), DType.BF16),
             ],
-            [TensorMeta.from_shape_dtype("grouped_gate_up_bwd_out", (G, M, ffn * 2), DType.BF16)],
+            [TensorMeta.from_shape_dtype("grouped_gate_up_bwd_out", (G, M, gate_up_dim), DType.BF16)],
             gates[0],
         )
         gate_up.component = "moe.grouped_gate_up_bwd"
@@ -345,5 +349,7 @@ class ExpertGroupedMMPass(GraphPass):
                 g.edges.append(Edge(e.src, e.src_idx, down_id, e.dst_idx, e.tensor))
 
         g.edges.append(Edge(down_id, 0, gate_up_id, 0, down.outputs[0]))
+        for e in out_edges:
+            g.edges.append(Edge(gate_up_id, e.src_idx, e.dst, e.dst_idx, e.tensor))
 
         g._rebuild_adjacency()

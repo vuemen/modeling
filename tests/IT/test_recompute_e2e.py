@@ -124,7 +124,7 @@ def _capture_model():
             pytest.skip("FakeTensorMode already in use by another test module")
         raise
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 def captured_model():
     return _capture_model()
 
