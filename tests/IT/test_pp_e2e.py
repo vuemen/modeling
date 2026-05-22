@@ -212,30 +212,10 @@ def _get_stage_layer_assignment(graph) -> dict[int, set[int]]:
         stage_layers.setdefault(stage_id, set()).add(layer_idx)
     return stage_layers
 
-
-def _is_contiguous(layers: set[int]) -> bool:
-    """Check if a set of layer indices forms a contiguous integer range."""
-    if len(layers) <= 1:
-        return True
-    sorted_layers = sorted(layers)
-    return all(sorted_layers[i + 1] - sorted_layers[i] == 1 for i in range(len(sorted_layers) - 1))
-
-
-def _get_stage_compute_load(graph) -> dict[int, float]:
-    """Sum compute_us per stage from node annotations."""
-    stage_load: dict[int, float] = {}
-    for n in graph.nodes.values():
-        if n.op_type.startswith("comm."):
-            continue
-        stage_id = n.annotations.get("stage_id", -1)
-        if stage_id < 0:
-            continue
-        load = (n.annotations.get("compute_us")
-                or n.annotations.get("latency_us")
-                or n.annotations.get("flops", 0) / 1e12
-                or 1.0)
-        stage_load[stage_id] = stage_load.get(stage_id, 0.0) + load
-    return stage_load
+def _get_layers_for_stage(graph, stage_id: int) -> set[int]:
+    """Get the set of layer indices assigned to a specific stage."""
+    assignment = _get_stage_layer_assignment(graph)
+    return assignment.get(stage_id, set())
 
 
 class TestPPScheduleTheoryValidation:
@@ -506,28 +486,6 @@ class TestPPScheduleFlopsConsistency:
                 all_assigned |= layers
             assert all_assigned == expected_layers, \
                 f"{schedule}: missing layers {expected_layers - all_assigned}, got {all_assigned}"
-
-
-def _get_layers_for_stage(graph, stage_id: int) -> set[int]:
-    """Get the set of layer indices assigned to a specific stage."""
-    assignment = _get_stage_layer_assignment(graph)
-    return assignment.get(stage_id, set())
-
-
-class TestStageLayerAssignment:
-    """验证不同流水线策略下 stage 的精确层分配。
-
-    DeepSeek-V4 4层模型，pp=2：
-
-    层分配策略：
-      - 1F1B/DualPipe (greedy bin-packing): 按 compute load 装箱，
-        greedy 按层索引顺序分配到累计 load 最小的 stage。
-        由于 L0→stage0, L1→stage1（L1 时 stage1 空，load=0 < stage0 正数 load），
-        {0,1} 同 stage 在 greedy 下不可能。实际结果取决于各层 compute load 分布，
-        需运行后确认具体映射。
-      - DualPipeV/VPP (round-robin interleaved): 层按 chunk 交替分配，
-        算法确定性 → stage0={0,2}, stage1={1,3}
-    """
 
     def test_1f1b_first_two_layers_split(self, cached_reports):
         """1F1B greedy 装箱：L0 和 L1 必须分到不同 stage。
