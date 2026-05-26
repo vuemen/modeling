@@ -470,6 +470,164 @@ def test_multi_tier_picks_outermost_link_for_p2p():
     assert t == pytest.approx(expected, rel=0.01)
 
 
+# ─────────────────────────────────────────────────────────────────────
+# Hierarchical A2A (issue #143 P1)
+# ─────────────────────────────────────────────────────────────────────
+
+
+def test_hierarchical_a2a_never_worse_than_flat_inter():
+    """Cross-node EP A2A: the new path must never be slower than the old
+    flat-on-inter path (the implementation takes min(flat, hier) as a
+    proxy for NCCL's runtime auto-selection)."""
+    from zrt.training.models.comm import collective_time_hierarchical
+    sys = _make_system()  # 4 nodes × 8 gpus/node
+    N = 32  # multi-node EP group
+    for S in (64 * 1024, 1024 * 1024, 50 * 1024 * 1024):
+        c = Collective("ep_a2a", "A2A", "EP", S, "op1")
+        t_hier = collective_time_hierarchical(c, N, sys)
+        t_flat = collective_time(c, N, sys.interconnect.inter_node)
+        assert t_hier <= t_flat + 1e-12, (
+            f"hierarchical A2A ({t_hier*1e6:.2f}µs) must be ≤ flat inter "
+            f"({t_flat*1e6:.2f}µs) for S={S}"
+        )
+
+
+def test_hierarchical_a2a_strictly_faster_for_small_payloads():
+    """At small S the 2-stage hier wins (latency on inter shrinks from
+    log2(N)·α_inter to log2(L)·α_inter and the intra phase is cheap).
+
+    Use N=256 so L=32 (>16) and the inter sub-A2A also uses Bruck —
+    otherwise small L would fall back to the (N-1)·α pairwise formula
+    and add latency that cancels the win."""
+    from zrt.training.models.comm import collective_time_hierarchical
+    sys = _make_system()
+    N = 256  # D=8 intra, L=32 inter — both use Bruck (N>16)
+    S = 256 * 1024  # 256 KB — latency-dominated
+    c = Collective("ep_a2a_small", "A2A", "EP", S, "op1")
+    t_hier = collective_time_hierarchical(c, N, sys)
+    t_flat = collective_time(c, N, sys.interconnect.inter_node)
+    assert t_hier < t_flat, (
+        f"small-S hier ({t_hier*1e6:.2f}µs) should beat flat inter "
+        f"({t_flat*1e6:.2f}µs) — issue #143 P1 regression check"
+    )
+
+
+def test_hierarchical_a2a_matches_flat_intra_when_in_one_node():
+    """A2A group that fits in one node: hierarchical == flat intra."""
+    from zrt.training.models.comm import collective_time_hierarchical
+    sys = _make_system()
+    N = 8  # fits in one node
+    S = 20 * 1024 * 1024
+    c = Collective("a2a", "A2A", "EP", S, "op1")
+    t_hier = collective_time_hierarchical(c, N, sys)
+    t_intra = collective_time(c, N, sys.interconnect.intra_node)
+    assert t_hier == pytest.approx(t_intra, rel=1e-12)
+
+
+def test_hierarchical_a2a_two_tier_formula():
+    """Verify the 2-stage A2A formula returns min(flat, intra+inter).
+
+    Picks a config (large N, small S) where hier strictly wins so the
+    returned cost equals the raw additive sum and the formula is
+    directly verifiable. The min(flat, hier) clamp is exercised by
+    :func:`test_hierarchical_a2a_never_worse_than_flat_inter`."""
+    from zrt.training.models.comm import collective_time_hierarchical
+    sys = _make_system()
+    N, D = 256, 8
+    L = N // D  # 32 — both intra and inter use Bruck
+    S = 512 * 1024  # latency-dominated → hier strictly wins
+    c = Collective("a2a", "A2A", "EP", S, "op1")
+    t_hier = collective_time_hierarchical(c, N, sys)
+
+    intra_c = Collective("a2a_intra", "A2A", "EP", S, "op1")
+    inter_c = Collective("a2a_inter", "A2A", "EP", S, "op1")
+    t_intra = collective_time(intra_c, D, sys.interconnect.intra_node)
+    t_inter = collective_time(inter_c, L, sys.interconnect.inter_node)
+    t_sum = t_intra + t_inter
+    t_flat = collective_time(c, N, sys.interconnect.inter_node)
+    # Sanity: hier should win in this regime
+    assert t_sum < t_flat, "test config: expected hier to win cleanly"
+    assert t_hier == pytest.approx(t_sum, rel=1e-12)
+
+
+def test_multi_tier_a2a_decomposes_across_three_tiers():
+    """N-tier A2A: sum of per-tier A2A costs across the breakdown."""
+    from zrt.training.models.comm import (
+        _tier_breakdown, collective_time_multi_tier,
+    )
+    sys = _make_3tier_system(world_size=512)
+    # 128 ranks → spans tray(4) + rack(16) + spine(2).
+    ranks = list(range(128))
+    breakdown = _tier_breakdown(ranks, sys.interconnect.tiers)
+    assert [d for d, _ in breakdown] == [4, 16, 2]
+
+    S = 32 * 1024 * 1024
+    c = Collective("a2a", "A2A", "EP", S, "op1")
+    t = collective_time_multi_tier(c, ranks, sys)
+
+    # Expected: sum of A2A on each tier with full payload S at each.
+    expected = sum(
+        collective_time(Collective(f"_t{d}", "A2A", "EP", S, "op1"), d, link)
+        for d, link in breakdown
+    )
+    assert t == pytest.approx(expected, rel=1e-12)
+
+
+def test_multi_tier_a2a_beats_flat_outer_for_cross_tier_group():
+    """3-tier hierarchical A2A vs old flat-outer behavior: hierarchical
+    should be strictly faster when the group crosses tiers, because the
+    slow spine link only carries S·(d_spine-1)/d_spine instead of the
+    full-N bus-bw term."""
+    from zrt.training.models.comm import collective_time_multi_tier
+    sys = _make_3tier_system(world_size=512)
+    ranks = list(range(128))  # crosses spine
+    S = 32 * 1024 * 1024
+    c = Collective("a2a", "A2A", "EP", S, "op1")
+    t_hier = collective_time_multi_tier(c, ranks, sys)
+    # Old behavior: flat A2A on outermost spine link with N=128
+    spine_link = sys.interconnect.tiers[-1].link
+    t_old = collective_time(c, 128, spine_link)
+    assert t_hier < t_old, (
+        f"3-tier hierarchical A2A ({t_hier*1e6:.1f}µs) should beat "
+        f"flat-on-spine ({t_old*1e6:.1f}µs) for cross-spine group"
+    )
+
+
+def test_comm_domain_routes_a2a_through_hierarchical_on_2tier():
+    """CommDomain 2-tier path: A2A should now go through
+    collective_time_hierarchical (not flat collective_time), so a
+    multi-node EP group benefits from intra+inter decomposition."""
+    from zrt.training.models.comm import (
+        collective_time_hierarchical, total_comm_time,
+    )
+    from zrt.training.spec.model import ModelSpec, LayerKind
+    from zrt.training.spec.strategy import Strategy
+    from zrt.training.ir.training_graph import Graph, Collective as Col
+
+    sys = _make_system()  # 2-tier H100-style
+    S = 8 * 1024 * 1024
+    a2a = Col(name="ep_a2a", kind="A2A", group="EP", bytes_=S,
+              inserted_after="op")
+    graph = Graph(ops=[], collectives=[a2a])
+    model = ModelSpec(
+        hidden=512, ffn=2048, num_heads=8, num_kv_heads=8,
+        head_dim=64, vocab=1024, seq_len=128,
+        layers=[LayerKind.MOE] * 2, num_experts=8, top_k=2,
+    )
+    # tp=2, dp=8, ep=16 → cross-node EP group of 16 ranks
+    strategy = Strategy(
+        tp=2, pp=1, ep=16, dp=16, micro_batch=1, global_batch=16,
+    )
+    result = total_comm_time(graph, model, sys, strategy)
+    # Expected: hierarchical A2A over 16 ranks (D=8 intra, L=2 inter)
+    expected = collective_time_hierarchical(a2a, 16, sys)
+    assert result["ep_a2a"] == pytest.approx(expected, rel=1e-12)
+    # Sanity: hierarchical must be strictly less than flat-inter for
+    # this cross-node group.
+    flat_inter = collective_time(a2a, 16, sys.interconnect.inter_node)
+    assert expected < flat_inter
+
+
 def test_total_comm_time_uses_multi_tier_when_3plus_tiers():
     """End-to-end: total_comm_time picks the multi-tier path automatically
     when the system has 3+ interconnect tiers."""
